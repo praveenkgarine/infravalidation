@@ -3,6 +3,13 @@
   "environment": "dev",
   "subscriptionId": "00000000-0000-0000-0000-000000000000",
   "resourceGroup": "rg-orders-dev",
+  "resourceTypes": {
+    "postgresFlexibleServer": true
+  },
+  "privateDns": {
+    "subscriptionId": "11111111-1111-1111-1111-111111111111",
+    "resourceGroup": "rg-private-dns"
+  },
 
   "resources": [
     {
@@ -127,6 +134,46 @@
           "expected": "Disabled"
         }
       ]
+    },
+    {
+      "key": "logic",
+      "type": "logicAppStandard",
+      "enabled": false,
+      "name": "logic-orders-dev",
+      "checks": [
+        { "path": "properties.publicNetworkAccess", "expected": "Disabled" },
+        { "path": "properties.virtualNetworkSubnetId", "operator": "exists" }
+      ]
+    },
+    {
+      "key": "acr",
+      "type": "containerRegistry",
+      "enabled": false,
+      "name": "acrordersdev",
+      "checks": [
+        { "path": "sku.name", "expected": "Premium" },
+        { "path": "properties.publicNetworkAccess", "expected": "Disabled" },
+        { "path": "properties.adminUserEnabled", "expected": false }
+      ]
+    },
+    {
+      "key": "sql",
+      "type": "sqlServer",
+      "enabled": false,
+      "name": "sql-orders-dev",
+      "checks": [
+        { "path": "properties.publicNetworkAccess", "expected": "Disabled" },
+        { "path": "properties.minimalTlsVersion", "expected": "1.2" }
+      ]
+    },
+    {
+      "key": "sqldb",
+      "type": "sqlDatabase",
+      "enabled": false,
+      "name": "sql-orders-dev/orders",
+      "checks": [
+        { "path": "properties.status", "expected": "Online" }
+      ]
     }
   ],
 
@@ -135,34 +182,71 @@
       "name": "pe-orders-cosmos",
       "target": "cosmos",
       "groupId": "Sql",
+      "dnsRecords": [
+        { "hostname": "cosmos-orders-dev.documents.azure.com", "zoneName": "privatelink.documents.azure.com", "recordName": "cosmos-orders-dev" }
+      ],
       "subnetId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-network-dev/providers/Microsoft.Network/virtualNetworks/vnet-dev/subnets/private-endpoints"
     },
     {
       "name": "pe-orders-postgres",
       "target": "postgres",
-      "groupId": "postgresqlServer"
+      "groupId": "postgresqlServer",
+      "dnsRecords": [
+        { "hostname": "pg-orders-dev.postgres.database.azure.com", "zoneName": "privatelink.postgres.database.azure.com", "recordName": "pg-orders-dev" }
+      ]
     },
     {
       "name": "pe-orders-function",
       "target": "function",
-      "groupId": "sites"
+      "groupId": "sites",
+      "dnsRecords": [
+        { "hostname": "func-orders-dev.azurewebsites.net", "zoneName": "privatelink.azurewebsites.net", "recordName": "func-orders-dev" }
+      ]
     },
     {
       "name": "pe-orders-storage-blob",
       "target": "storage",
-      "groupId": "blob"
+      "groupId": "blob",
+      "dnsRecords": [
+        { "hostname": "stordersdev.blob.core.windows.net", "zoneName": "privatelink.blob.core.windows.net", "recordName": "stordersdev" }
+      ]
     },
     {
       "name": "pe-orders-environment",
       "target": "environment",
       "groupId": "managedEnvironments"
+    },
+    {
+      "name": "pe-orders-logic",
+      "target": "logic",
+      "groupId": "sites",
+      "dnsRecords": [
+        { "hostname": "logic-orders-dev.azurewebsites.net", "zoneName": "privatelink.azurewebsites.net", "recordName": "logic-orders-dev" }
+      ]
+    },
+    {
+      "name": "pe-orders-acr",
+      "target": "acr",
+      "groupId": "registry",
+      "dnsRecords": [
+        { "hostname": "acrordersdev.azurecr.io", "zoneName": "privatelink.azurecr.io", "recordName": "acrordersdev" },
+        { "hostname": "acrordersdev.eastus.data.azurecr.io", "zoneName": "privatelink.azurecr.io", "recordName": "acrordersdev.eastus.data" }
+      ]
+    },
+    {
+      "name": "pe-orders-sql",
+      "target": "sql",
+      "groupId": "sqlServer",
+      "dnsRecords": [
+        { "hostname": "sql-orders-dev.database.windows.net", "zoneName": "privatelink.database.windows.net", "recordName": "sql-orders-dev" }
+      ]
     }
   ],
 
   "dnsLinks": [
     {
       "zoneName": "privatelink.documents.azure.com",
-      "resourceGroup": "rg-dns-dev",
+      "resourceGroup": "rg-private-dns",
       "linkName": "link-vnet-dev",
       "vnetId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-network-dev/providers/Microsoft.Network/virtualNetworks/vnet-dev"
     }
@@ -171,12 +255,14 @@
   "networkProbes": [
     {
       "name": "Cosmos connection from validation runner",
+      "target": "cosmos",
       "hostname": "cosmos-orders-dev.documents.azure.com",
       "expectedAddresses": ["10.20.3.4"],
       "port": 443
     },
     {
       "name": "PostgreSQL connection from validation runner",
+      "target": "postgres",
       "hostname": "pg-orders-dev.postgres.database.azure.com",
       "expectedAddresses": ["10.20.3.5"],
       "port": 5432

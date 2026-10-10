@@ -30,6 +30,11 @@ $types = @{
     postgresFlexibleServer  = 'Microsoft.DBforPostgreSQL/flexibleServers'
     cosmosAccount           = 'Microsoft.DocumentDB/databaseAccounts'
     managedIdentity         = 'Microsoft.ManagedIdentity/userAssignedIdentities'
+    logicAppStandard        = 'Microsoft.Web/sites'
+    logicAppConsumption     = 'Microsoft.Logic/workflows'
+    containerRegistry       = 'Microsoft.ContainerRegistry/registries'
+    sqlServer               = 'Microsoft.Sql/servers'
+    sqlDatabase             = 'Microsoft.Sql/servers/databases'
 }
 
 function Add-Result {
@@ -202,6 +207,122 @@ function Get-EntryId {
         $id += "/$($typeParts[$index + 1])/$($nameParts[$index])"
     }
     return $id
+}
+
+function Test-ResourceEnabled {
+    param($Entry)
+    if ($Entry.enabled -eq $false) { return $false }
+    if (-not $inventory.resourceTypes) { return $true }
+    $setting = $inventory.resourceTypes.PSObject.Properties[$Entry.type]
+    return ($null -eq $setting -or $setting.Value -ne $false)
+}
+
+function Test-AddressSet {
+    param($Actual, $Expected)
+    $left = @($Actual | Where-Object { $_ } | Sort-Object -Unique)
+    $right = @($Expected | Where-Object { $_ } | Sort-Object -Unique)
+    if ($left.Count -eq 0 -or $right.Count -eq 0) { return $false }
+    return (@(Compare-Object -ReferenceObject $right -DifferenceObject $left).Count -eq 0)
+}
+
+function Get-EndpointDnsAddresses {
+    param($Endpoint, $Record)
+    # NIC addresses are authoritative; never compare a hostname with all ACR IPs.
+    $configurations = @()
+    foreach ($nic in @($Endpoint.properties.networkInterfaces | Where-Object { $_ })) {
+        $networkInterface = Get-Resource $nic.id
+        $configurations += @($networkInterface.properties.ipConfigurations | Where-Object { $_ })
+    }
+    $allAddresses = @($configurations | ForEach-Object { $_.properties.privateIPAddress } |
+        Where-Object { $_ } | Sort-Object -Unique)
+    if ($allAddresses.Count -eq 0) { throw 'Private endpoint NIC has no readable private IP addresses.' }
+    $fqdn = if ($Record.endpointFqdn) { $Record.endpointFqdn } else { $Record.hostname }
+    $normalized = $fqdn.TrimEnd('.').ToLowerInvariant().Replace('.privatelink.', '.')
+    $addresses = @()
+    foreach ($configuration in $configurations) {
+        if ($Record.ipConfigurationName) {
+            if ($configuration.name -eq $Record.ipConfigurationName) {
+                $addresses += $configuration.properties.privateIPAddress
+            }
+            continue
+        }
+        foreach ($name in @($configuration.properties.privateLinkConnectionProperties.fqdns | Where-Object { $_ })) {
+            if ($name.TrimEnd('.').ToLowerInvariant().Replace('.privatelink.', '.') -eq $normalized) {
+                $addresses += $configuration.properties.privateIPAddress
+            }
+        }
+    }
+    if (-not $Record.ipConfigurationName -and $addresses.Count -eq 0) {
+        foreach ($dns in @($Endpoint.properties.customDnsConfigs | Where-Object { $_ })) {
+            if ($dns.fqdn -and $dns.fqdn.TrimEnd('.').ToLowerInvariant().Replace('.privatelink.', '.') -eq $normalized) {
+                foreach ($address in @($dns.ipAddresses)) {
+                    if ($allAddresses -notcontains $address) {
+                        throw "Endpoint DNS metadata address $address is not assigned to its NIC."
+                    }
+                    $addresses += $address
+                }
+            }
+        }
+    }
+    if ($addresses.Count -eq 0) {
+        throw "Cannot map $fqdn to a private endpoint NIC IP. Set endpointFqdn or ipConfigurationName; do not use all NIC IPs for a multi-address endpoint."
+    }
+    return @($addresses | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+function Resolve-RunnerDns {
+    param([string] $Hostname, [string] $Server)
+    if (-not (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)) {
+        throw 'Runner DNS checks require Windows Resolve-DnsName. Run from the Windows VDI with -RunNetworkChecks.'
+    }
+    $arguments = @{Name=$Hostname; Type='A'; DnsOnly=$true; NoHostsFile=$true; ErrorAction='Stop'}
+    if ($Server) { $arguments.Server = $Server }
+    # Uses the VDI DNS servers by default, follows CNAMEs, and excludes hosts-file answers.
+    return @(Resolve-DnsName @arguments | Where-Object { $_.Type -eq 'A' -and $_.IPAddress } |
+        ForEach-Object { $_.IPAddress } | Sort-Object -Unique)
+}
+
+function Test-PrivateEndpointDns {
+    param($Pe, $Endpoint)
+    foreach ($record in @($Pe.dnsRecords | Where-Object { $_ })) {
+        $label = "$($Pe.name) / $($record.hostname)"
+        try {
+            $addresses = @(Get-EndpointDnsAddresses $Endpoint $record)
+            Add-Result $label 'Private endpoint NIC IP mapping' 'Pass' $record.hostname $addresses
+        }
+        catch {
+            Add-Result $label 'Private endpoint NIC IP mapping' 'Error' 'Hostname-specific NIC IPs' $null $_.Exception.Message
+            continue
+        }
+        try {
+            $subscription = if ($record.subscriptionId) { $record.subscriptionId } else { $inventory.privateDns.subscriptionId }
+            $group = if ($record.resourceGroup) { $record.resourceGroup } else { $inventory.privateDns.resourceGroup }
+            $dnsEntry = [pscustomobject]@{
+                subscriptionId=$subscription; resourceGroup=$group
+                name="$($record.zoneName)/$($record.recordName)"
+            }
+            $dnsId = Get-EntryId $dnsEntry 'Microsoft.Network/privateDnsZones/A'
+            $dns = Get-Resource $dnsId
+            $zoneAddresses = @($dns.properties.aRecords | ForEach-Object { $_.ipv4Address })
+            Assert-Value $label 'Azure private DNS A record matches endpoint' `
+                (Test-AddressSet $zoneAddresses $addresses) $addresses $zoneAddresses
+        }
+        catch {
+            Add-Result $label 'Azure private DNS A record' 'Error' $addresses $null $_.Exception.Message
+        }
+        if (-not $RunNetworkChecks) {
+            Add-Result $label 'VDI DNS matches endpoint' 'NotTested' $addresses $null 'Run from the VDI with -RunNetworkChecks.'
+            continue
+        }
+        try {
+            $server = if ($record.dnsServer) { $record.dnsServer } else { $inventory.privateDns.dnsServer }
+            $resolved = @(Resolve-RunnerDns $record.hostname $server)
+            Assert-Value $label 'VDI DNS matches endpoint' (Test-AddressSet $resolved $addresses) $addresses $resolved
+        }
+        catch {
+            Add-Result $label 'VDI DNS resolution' 'Error' $addresses $null $_.Exception.Message
+        }
+    }
 }
 
 function Get-FunctionRouting {
@@ -494,6 +615,12 @@ if (-not $inventory.application -or -not $inventory.resources) {
     throw 'Inventory requires application and a nonempty resources array.'
 }
 
+foreach ($setting in @($inventory.resourceTypes.PSObject.Properties | Where-Object { $_ })) {
+    if (-not $types.ContainsKey($setting.Name) -or $setting.Value -isnot [bool]) {
+        throw 'resourceTypes must map supported resource types to boolean values.'
+    }
+}
+
 foreach ($entry in $inventory.resources) {
     if (-not $entry.key -or $entries.ContainsKey($entry.key)) {
         throw "Missing or duplicate resource key: $($entry.key)"
@@ -505,6 +632,10 @@ foreach ($entry in $inventory.resources) {
     }
 
     $entries[$entry.key] = $entry
+    if ($entry.PSObject.Properties['enabled'] -and $entry.enabled -isnot [bool]) {
+        throw "Resource $($entry.key) enabled must be a boolean."
+    }
+    if (-not (Test-ResourceEnabled $entry)) { continue }
     $resourceIds[$entry.key] = Get-EntryId $entry $resourceType
 
     foreach ($check in @($entry.checks | Where-Object { $null -ne $_ })) {
@@ -525,6 +656,7 @@ foreach ($entry in $inventory.resources) {
 }
 
 foreach ($entry in $inventory.resources) {
+    if (-not (Test-ResourceEnabled $entry)) { continue }
     if ($entry.functionValidation) {
         if ($entry.type -ne 'functionApp') { throw 'functionValidation requires a functionApp resource.' }
         foreach ($traffic in @('applicationTraffic', 'contentShareTraffic')) {
@@ -536,9 +668,9 @@ foreach ($entry in $inventory.resources) {
         foreach ($purpose in @('host', 'content')) {
             $policy = $entry.functionValidation.$purpose
             if ($policy.expectedResource -and
-                (-not $entries.ContainsKey($policy.expectedResource) -or
+                (-not $resourceIds.ContainsKey($policy.expectedResource) -or
                     $entries[$policy.expectedResource].type -ne 'storageAccount')) {
-                throw "functionValidation.$purpose.expectedResource must reference a storageAccount."
+                throw "functionValidation.$purpose.expectedResource must reference an enabled storageAccount."
             }
             foreach ($check in @($policy.checks | Where-Object { $null -ne $_ })) {
                 if (-not $check.path -or -not $check.PSObject.Properties['expected']) {
@@ -561,16 +693,38 @@ foreach ($entry in $inventory.resources) {
 }
 
 foreach ($pe in @($inventory.privateEndpoints | Where-Object { $null -ne $_ })) {
-    if (-not $resourceIds.ContainsKey($pe.target) -or -not $pe.groupId) {
+    if (-not $entries.ContainsKey($pe.target) -or -not $pe.groupId) {
         throw 'Private endpoint requires a known target and groupId.'
+    }
+    if (-not (Test-ResourceEnabled $entries[$pe.target])) { continue }
+    $null = Get-EntryId $pe 'Microsoft.Network/privateEndpoints'
+    if ($entries[$pe.target].type -eq 'sqlDatabase') {
+        throw 'SQL private endpoints target a sqlServer resource, not an individual sqlDatabase.'
+    }
+    if ($entries[$pe.target].type -eq 'logicAppConsumption') {
+        throw 'Logic App private endpoints require logicAppStandard, not logicAppConsumption.'
+    }
+    foreach ($record in @($pe.dnsRecords | Where-Object { $_ })) {
+        foreach ($field in @('hostname', 'zoneName', 'recordName')) {
+            if (-not $record.$field -or $record.$field -isnot [string]) {
+                throw "Private endpoint dnsRecords requires $field."
+            }
+        }
+        foreach ($field in @('subscriptionId', 'resourceGroup')) {
+            if (-not $record.$field -and -not $inventory.privateDns.$field) {
+                throw "Private endpoint DNS requires $field on the record or privateDns defaults."
+            }
+        }
     }
 }
 
 foreach ($permission in @($inventory.permissions | Where-Object { $null -ne $_ })) {
-    if (-not $resourceIds.ContainsKey($permission.source) -or
-        -not $resourceIds.ContainsKey($permission.target)) {
+    if (-not $entries.ContainsKey($permission.source) -or
+        -not $entries.ContainsKey($permission.target)) {
         throw 'Permission source and target must reference resource keys.'
     }
+    if (-not (Test-ResourceEnabled $entries[$permission.source]) -or
+        -not (Test-ResourceEnabled $entries[$permission.target])) { continue }
 
     if ($permission.kind -notin @('cosmosNoSql', 'postgres')) {
         throw "Unsupported permission kind: $($permission.kind)"
@@ -600,6 +754,12 @@ foreach ($permission in @($inventory.permissions | Where-Object { $null -ne $_ }
     }
 }
 
+foreach ($probe in @($inventory.networkProbes | Where-Object { $_ })) {
+    if ($probe.target -and -not $entries.ContainsKey($probe.target)) {
+        throw "Unknown network probe target: $($probe.target)"
+    }
+}
+
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw 'Azure CLI is not installed or is not on PATH.'
 }
@@ -609,9 +769,17 @@ $null = Invoke-AzJson @('account', 'show')
 # ---------- Resource configuration ----------
 
 foreach ($entry in $inventory.resources) {
+    if (-not (Test-ResourceEnabled $entry)) {
+        Add-Result $entry.key 'Resource included' 'Skipped' $false $false 'Disabled in the application definition; dependent endpoint and permission checks are skipped.'
+        continue
+    }
     try {
         $resource = Get-Resource $resourceIds[$entry.key]
         Add-Result $entry.key 'Resource exists' 'Pass' $true $true
+        if ($entry.type -eq 'logicAppStandard') {
+            Assert-Value $entry.key 'Standard Logic App kind' `
+                (@($resource.kind -split ',') -contains 'workflowapp') 'workflowapp' $resource.kind
+        }
 
         foreach ($check in @($entry.checks | Where-Object { $null -ne $_ })) {
             $actual = Get-PropertyPath $resource $check.path
@@ -645,6 +813,7 @@ foreach ($entry in $inventory.resources) {
 # ---------- Function outbound routing and discovered backing storage ----------
 
 foreach ($entry in $inventory.resources | Where-Object { $_.type -eq 'functionApp' -and $_.functionValidation }) {
+    if (-not (Test-ResourceEnabled $entry)) { continue }
     try { Test-FunctionInfrastructure $entry }
     catch {
         Add-Result $entry.key 'Function infrastructure' 'Error' 'Readable Function configuration' $null $_.Exception.Message
@@ -654,6 +823,10 @@ foreach ($entry in $inventory.resources | Where-Object { $_.type -eq 'functionAp
 # ---------- Private endpoints ----------
 
 foreach ($pe in @($inventory.privateEndpoints | Where-Object { $null -ne $_ })) {
+    if (-not (Test-ResourceEnabled $entries[$pe.target])) {
+        Add-Result $pe.name 'Private endpoint included' 'Skipped' $false $false 'Target resource is disabled.'
+        continue
+    }
     try {
         $id = Get-EntryId $pe 'Microsoft.Network/privateEndpoints'
         $endpoint = Get-Resource $id
@@ -698,6 +871,11 @@ foreach ($pe in @($inventory.privateEndpoints | Where-Object { $null -ne $_ })) 
             @($matches | ForEach-Object {
                 $_.properties.privateLinkServiceConnectionState.status
             })
+        if ($approved.Count -gt 0 -and $endpoint.properties.provisioningState -eq 'Succeeded') {
+            Test-PrivateEndpointDns $pe $endpoint
+        } elseif (@($pe.dnsRecords | Where-Object { $_ }).Count -gt 0) {
+            Add-Result $pe.name 'Private endpoint DNS' 'NotTested' 'Approved matching endpoint with successful provisioning' $null 'Fix endpoint target, approval and provisioning before validating its DNS.'
+        }
     }
     catch {
         Add-Result $pe.name 'Private endpoint' 'Error' `
@@ -711,8 +889,8 @@ foreach ($link in @($inventory.dnsLinks | Where-Object { $null -ne $_ })) {
     try {
         $dnsEntry = [pscustomobject]@{
             resourceId    = $link.resourceId
-            subscriptionId = $link.subscriptionId
-            resourceGroup = $link.resourceGroup
+            subscriptionId = $(if ($link.subscriptionId) { $link.subscriptionId } else { $inventory.privateDns.subscriptionId })
+            resourceGroup = $(if ($link.resourceGroup) { $link.resourceGroup } else { $inventory.privateDns.resourceGroup })
             name          = "$($link.zoneName)/$($link.linkName)"
         }
 
@@ -738,6 +916,10 @@ foreach ($link in @($inventory.dnsLinks | Where-Object { $null -ne $_ })) {
 # ---------- Network tests: validation runner's perspective ----------
 
 foreach ($probe in @($inventory.networkProbes | Where-Object { $null -ne $_ })) {
+    if ($probe.target -and -not (Test-ResourceEnabled $entries[$probe.target])) {
+        Add-Result $probe.name 'Network probe included' 'Skipped' $false $false 'Target resource is disabled.'
+        continue
+    }
     if (-not $RunNetworkChecks) {
         Add-Result $probe.name 'DNS/TCP from runner' 'NotTested' `
             'Run with -RunNetworkChecks' $null
@@ -796,6 +978,11 @@ foreach ($probe in @($inventory.networkProbes | Where-Object { $null -ne $_ })) 
 
 foreach ($permission in @($inventory.permissions | Where-Object { $null -ne $_ })) {
     $label = "$($permission.source) -> $($permission.target)"
+    if (-not (Test-ResourceEnabled $entries[$permission.source]) -or
+        -not (Test-ResourceEnabled $entries[$permission.target])) {
+        Add-Result $label 'Permission included' 'Skipped' $false $false 'Source or target resource is disabled.'
+        continue
+    }
 
     try {
         $principalId = Get-PrincipalId $permission
