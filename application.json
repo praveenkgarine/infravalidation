@@ -1,0 +1,237 @@
+{
+  "application": "orders",
+  "environment": "dev",
+  "subscriptionId": "00000000-0000-0000-0000-000000000000",
+  "resourceGroup": "rg-orders-dev",
+
+  "resources": [
+    {
+      "key": "environment",
+      "type": "containerAppEnvironment",
+      "name": "cae-orders-dev",
+      "checks": [
+        {
+          "path": "properties.vnetConfiguration.infrastructureSubnetId",
+          "expected": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-network-dev/providers/Microsoft.Network/virtualNetworks/vnet-dev/subnets/containerapps"
+        },
+        {
+          "path": "properties.publicNetworkAccess",
+          "expected": "Disabled"
+        }
+      ]
+    },
+    {
+      "key": "frontend",
+      "type": "containerApp",
+      "name": "ca-orders-frontend-dev",
+      "checks": [
+        {
+          "path": "properties.environmentId",
+          "expectedResource": "environment"
+        }
+      ]
+    },
+    {
+      "key": "backend",
+      "type": "containerApp",
+      "name": "ca-orders-backend-dev",
+      "checks": [
+        {
+          "path": "properties.environmentId",
+          "expectedResource": "environment"
+        },
+        {
+          "path": "properties.configuration.ingress.external",
+          "expected": false
+        },
+        {
+          "path": "identity.principalId",
+          "operator": "exists"
+        }
+      ]
+    },
+    {
+      "key": "function",
+      "type": "functionApp",
+      "name": "func-orders-dev",
+      "functionValidation": {
+        "applicationTraffic": true,
+        "contentShareTraffic": true,
+        "host": {
+          "expectedResource": "storage",
+          "checks": [
+            { "path": "properties.publicNetworkAccess", "expected": "Disabled" },
+            { "path": "properties.allowBlobPublicAccess", "expected": false },
+            { "path": "properties.supportsHttpsTrafficOnly", "expected": true },
+            { "path": "properties.minimumTlsVersion", "expected": "TLS1_2" }
+          ],
+          "privateEndpointGroups": ["blob", "queue", "table"]
+        }
+      },
+      "checks": [
+        {
+          "path": "properties.publicNetworkAccess",
+          "expected": "Disabled"
+        },
+        {
+          "path": "properties.virtualNetworkSubnetId",
+          "expected": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-network-dev/providers/Microsoft.Network/virtualNetworks/vnet-dev/subnets/functions"
+        },
+        {
+          "path": "identity.principalId",
+          "operator": "exists"
+        }
+      ]
+    },
+    {
+      "key": "storage",
+      "type": "storageAccount",
+      "name": "stordersdev",
+      "checks": [
+        {
+          "path": "properties.publicNetworkAccess",
+          "expected": "Disabled"
+        },
+        {
+          "path": "properties.allowBlobPublicAccess",
+          "expected": false
+        },
+        {
+          "path": "properties.supportsHttpsTrafficOnly",
+          "expected": true
+        }
+      ]
+    },
+    {
+      "key": "postgres",
+      "type": "postgresFlexibleServer",
+      "name": "pg-orders-dev",
+      "checks": [
+        {
+          "path": "properties.network.publicNetworkAccess",
+          "expected": "Disabled"
+        },
+        {
+          "path": "properties.authConfig.activeDirectoryAuth",
+          "expected": "Enabled"
+        }
+      ]
+    },
+    {
+      "key": "cosmos",
+      "type": "cosmosAccount",
+      "name": "cosmos-orders-dev",
+      "checks": [
+        {
+          "path": "properties.publicNetworkAccess",
+          "expected": "Disabled"
+        }
+      ]
+    }
+  ],
+
+  "privateEndpoints": [
+    {
+      "name": "pe-orders-cosmos",
+      "target": "cosmos",
+      "groupId": "Sql",
+      "subnetId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-network-dev/providers/Microsoft.Network/virtualNetworks/vnet-dev/subnets/private-endpoints"
+    },
+    {
+      "name": "pe-orders-postgres",
+      "target": "postgres",
+      "groupId": "postgresqlServer"
+    },
+    {
+      "name": "pe-orders-function",
+      "target": "function",
+      "groupId": "sites"
+    },
+    {
+      "name": "pe-orders-storage-blob",
+      "target": "storage",
+      "groupId": "blob"
+    },
+    {
+      "name": "pe-orders-environment",
+      "target": "environment",
+      "groupId": "managedEnvironments"
+    }
+  ],
+
+  "dnsLinks": [
+    {
+      "zoneName": "privatelink.documents.azure.com",
+      "resourceGroup": "rg-dns-dev",
+      "linkName": "link-vnet-dev",
+      "vnetId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-network-dev/providers/Microsoft.Network/virtualNetworks/vnet-dev"
+    }
+  ],
+
+  "networkProbes": [
+    {
+      "name": "Cosmos connection from validation runner",
+      "hostname": "cosmos-orders-dev.documents.azure.com",
+      "expectedAddresses": ["10.20.3.4"],
+      "port": 443
+    },
+    {
+      "name": "PostgreSQL connection from validation runner",
+      "hostname": "pg-orders-dev.postgres.database.azure.com",
+      "expectedAddresses": ["10.20.3.5"],
+      "port": 5432
+    }
+  ],
+
+  "permissions": [
+    {
+      "kind": "cosmosNoSql",
+      "source": "backend",
+      "target": "cosmos",
+      "identity": {
+        "type": "systemAssigned"
+      },
+      "roleDefinitionId": "00000000-0000-0000-0000-000000000002",
+      "scope": "/dbs/orders/colls/items"
+    },
+    {
+      "kind": "postgres",
+      "source": "backend",
+      "target": "postgres",
+      "identity": {
+        "type": "systemAssigned"
+      },
+      "host": "pg-orders-dev.postgres.database.azure.com",
+      "database": "orders",
+      "databaseRole": "orders-backend",
+      "validationUser": "postgres-validation-admin",
+      "grants": [
+        {
+          "kind": "database",
+          "object": "orders",
+          "privilege": "CONNECT"
+        },
+        {
+          "kind": "schema",
+          "object": "app",
+          "privilege": "USAGE"
+        },
+        {
+          "kind": "table",
+          "object": "app.orders",
+          "privilege": "SELECT"
+        },
+        {
+          "kind": "table",
+          "object": "app.orders",
+          "privilege": "INSERT"
+        },
+        {
+          "kind": "sequence",
+          "object": "app.orders_id_seq",
+          "privilege": "USAGE"
+        }
+      ]
+    }
+  ]
+}

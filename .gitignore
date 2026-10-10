@@ -1,0 +1,6 @@
+validation-results/
+reports/
+*.log
+.env
+.env.*
+!.env.example
